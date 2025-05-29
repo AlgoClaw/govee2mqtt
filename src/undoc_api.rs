@@ -382,17 +382,45 @@ impl GoveeUndocumentedApi {
         let catalog = Self::get_scenes_for_device(sku).await?;
         let mut options = vec![];
 
-        for c in catalog {
-            for s in c.scenes {
-                if let Some(param_id) = s.light_effects.get(0).map(|e| e.scence_param_id) {
-                    options.push(EnumOption {
-                        name: s.scene_name,
-                        value: json!({
-                            "paramId": param_id,
-                            "id": s.scene_id,
-                        }),
-                        extras: Default::default(),
-                    });
+        for c in catalog { // c is LightEffectCategory
+            for s in c.scenes { // s is LightEffectScene
+                if s.light_effects.is_empty() {
+                    continue; // Skip scenes with no light effects
+                }
+
+                let mut created_combined_name_for_scene_s = false;
+                for effect in &s.light_effects { // effect is &LightEffectEntry
+                    if !effect.scence_name.is_empty() {
+                        // If the light effect has its own specific "scenceName", create a combined name
+                        options.push(EnumOption {
+                            name: format!("{}-{}", s.scene_name, effect.scence_name),
+                            value: json!({
+                                "paramId": effect.scence_param_id, // Use this specific effect's param_id
+                                "id": s.scene_id,                 // Main scene's ID
+                            }),
+                            extras: Default::default(),
+                        });
+                        created_combined_name_for_scene_s = true;
+                    }
+                }
+
+                // If no combined names were created for this scene `s` 
+                // (e.g., all its light_effects had an empty scence_name),
+                // then add an entry for the main scene name, using the first effect's param_id
+                // (similar to the original snippet's behavior for the main scene entry).
+                if !created_combined_name_for_scene_s {
+                    // This ensures that if a scene has effects but none are individually named,
+                    // the main scene itself is still listed.
+                    if let Some(first_effect) = s.light_effects.get(0) {
+                        options.push(EnumOption {
+                            name: s.scene_name.clone(), // Use the main scene_name
+                            value: json!({
+                                "paramId": first_effect.scence_param_id, // paramId from the first light effect
+                                "id": s.scene_id,                        // Main scene's ID
+                            }),
+                            extras: Default::default(),
+                        });
+                    }
                 }
             }
         }
