@@ -237,27 +237,106 @@ impl LanDevice {
         .await
     }
 
-    pub async fn set_scene_by_name(&self, scene_name: &str) -> anyhow::Result<()> {
-        for category in GoveeUndocumentedApi::get_scenes_for_device(&self.sku).await? {
-            for scene in category.scenes {
-                for effect in scene.light_effects {
-                    if scene.scene_name == scene_name && effect.scene_code != 0 {
-                        let encoded = Base64HexBytes::encode_for_sku(
-                            "Generic:Light",
-                            &SetSceneCode::new(effect.scene_code, effect.scence_param),
-                        )?
-                        .base64();
-                        log::info!(
-                            "sending scene packet {encoded:x?} for {scene_name}, code {}",
-                            effect.scene_code
-                        );
-                        return self.send_real(encoded).await;
+    /// Sets a scene on the device by its name.
+    /// If a scene from the API has 2 or more light effects with non-empty "scenceName"
+    /// and a valid scene_code, this function will attempt to match `desired_scene_name_input`
+    /// against combined names like "MainSceneName-EffectScenceName".
+    /// Otherwise, it will try to match `desired_scene_name_input` against the main "sceneName"
+    /// from the API and use the first valid light effect's code.
+    pub async fn set_scene_by_name(
+        &self,
+        desired_scene_name_input: &str,
+    ) -> anyhow::Result<()> {
+        // Fetch scene data from the Govee Undocumented API.
+        // This call is expected to return a Vec of Category-like structs,
+        // which in turn contain Vec of Scene-like structs,
+        // and those contain Vec of LightEffect-like structs.
+        // The exact struct names (UndocCategory, UndocScene, UndocLightEffect)
+        // would be defined in `crate::undoc_api`.
+        let categories_from_api =
+            GoveeUndocumentedApi::get_scenes_for_device(&self.sku).await?;
+
+        for category in categories_from_api {
+            // Assuming `category.scenes` gives an iterable of Scene-like structs
+            for scene in &category.scenes {
+                let main_api_scene_name = &scene.scene_name; // eg: "Rainbow"
+
+                // Filter light effects that are eligible for forming a combined name:
+                // - Must have a non-empty `scence_name` (e.g., "A", "B")
+                // - Must have a valid `scene_code` (not 0)
+                // Assuming `scene.light_effects` gives an iterable of LightEffect-like structs
+                // which have `scence_name: String`, `scene_code: u32`,
+                // and `scence_param: Option<JsonValue>` (or compatible).
+                let eligible_effects_for_combined_name: Vec<_> = scene // Using Vec<_> to let compiler infer type
+                    .light_effects
+                    .iter()
+                    .filter(|eff| !eff.scence_name.is_empty() && eff.scene_code != 0)
+                    .collect();
+
+                if eligible_effects_for_combined_name.len() >= 2 {
+                    // This scene has 2 or more eligible light effects for combined naming.
+                    // We will ONLY try to match combined names for this API scene.
+                    for effect in eligible_effects_for_combined_name {
+                        let combined_name =
+                            format!("{}-{}", main_api_scene_name, effect.scence_name);
+                        if combined_name == desired_scene_name_input {
+                            // Match found with a combined name.
+                            let encoded = Base64HexBytes::encode_for_sku(
+                                "Generic:Light", // As per original code
+                                &SetSceneCode::new(effect.scene_code, effect.scence_param.clone()), // Clone scence_param if it's not Copy (e.g. Option<JsonValue>)
+                            )?
+                            .base64();
+                            log::info!(
+                                "Sending scene packet for combined name '{}', using effect code {}. Encoded: {:?}",
+                                combined_name,
+                                effect.scene_code,
+                                encoded
+                            );
+                            return self.send_real(encoded).await;
+                        }
+                    }
+                    // If no combined name matched for this scene, we move to the next scene from the API.
+                    // We do not fall back to matching the main_api_scene_name for this specific `scene` object.
+                } else {
+                    // This scene has fewer than 2 eligible light effects for combined naming.
+                    // We will try to match the desired_scene_name_input against the main_api_scene_name.
+                    if main_api_scene_name == desired_scene_name_input {
+                        // Main scene name matches. Find the first usable light effect.
+                        // The original code iterated all effects and used the first one with scene_code != 0.
+                        for effect in &scene.light_effects {
+                            if effect.scene_code != 0 {
+                                let encoded = Base64HexBytes::encode_for_sku(
+                                    "Generic:Light",
+                                    &SetSceneCode::new(
+                                        effect.scene_code,
+                                        effect.scence_param.clone(), // Clone if not Copy
+                                    ),
+                                )?
+                                .base64();
+                                log::info!(
+                                    "Sending scene packet for main name '{}', using effect code {}. Encoded: {:?}",
+                                    main_api_scene_name,
+                                    effect.scene_code,
+                                    encoded
+                                );
+                                return self.send_real(encoded).await;
+                            }
+                        }
+                        // If main_api_scene_name matched, but no light effect with scene_code != 0 was found,
+                        // this particular API scene cannot be activated. We continue to the next API scene.
                     }
                 }
             }
         }
 
-        anyhow::bail!("unable to set scene {scene_name} for {}", self.device);
+        // If we've looped through all categories and scenes and haven't returned Ok(()),
+        // then no suitable scene (either main or combined) was found.
+        anyhow::bail!(
+            "Unable to find and set scene matching '{}' for device SKU '{}', device ID '{}'",
+            desired_scene_name_input,
+            self.sku,
+            self.device
+        );
     }
 }
 
