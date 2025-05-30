@@ -613,7 +613,7 @@ impl State {
                             .light_effects
                             .iter()
                             // effect is &crate::undoc_api::LightEffectEntry
-                            .filter(|effect| !effect.scence_name.is_empty() && effect.scene_code != 0)
+                            .filter(|effect| !effect.scence_name.is_empty())
                             .collect();
 
                         if eligible_effects_for_combined_name.len() >= 2 {
@@ -629,21 +629,7 @@ impl State {
                         // If no combined names were generated for this main scene,
                         // add the main scene name itself.
                         if !added_combined_name_for_this_main_scene {
-                            // Only add the main scene name if it has any light effects with a valid code,
-                            // or if the scene itself has a valid scene_code (for scenes without discrete effects listed)
-                            let has_any_valid_effect_code = scene.light_effects.iter().any(|eff| eff.scene_code != 0);
-                            if has_any_valid_effect_code || (scene.light_effects.is_empty() && scene.scene_code != 0) {
-                                names.push(main_api_scene_name.clone());
-                            } else if scene.light_effects.is_empty() && scene.scene_code == 0 && !names.contains(main_api_scene_name) {
-                                // If a scene has no light effects and scene_code 0, but is listed,
-                                // it might be a placeholder or a very simple scene. Add its name if not already present
-                                // from a combined name scenario (though unlikely here).
-                                // This case might need further refinement based on actual Govee API behavior for such scenes.
-                                // For now, let's add it if it's a distinct scene name.
-                                // The original snippet simply added scene.scene_name if any effect.scene_code != 0.
-                                // This new logic is more aligned with list_scene_names_for_ha.
-                                names.push(main_api_scene_name.clone());
-                            }
+							names.push(main_api_scene_name.clone());
                         }
                     }
                 }

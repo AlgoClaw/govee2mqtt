@@ -320,111 +320,88 @@ impl SetSceneCode {
 
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         let model_params = find_params_for_sku(&self.sku)?;
-        let mut all_command_lines_data: Vec<Vec<u8>> = Vec::new();
-        
-        // Determine matched_type_entry first, as it's needed for modeCmd too
-        let matched_type_entry = if self.scence_param.is_empty() {
-            model_params.type_entries.iter()
-                .find(|te| te.hex_prefix_remove.is_empty()) 
+
+        let mut current_scence_bytes = data_encoding::BASE64.decode(self.scence_param.as_bytes())
+            .with_context(|| format!("Failed to decode base64 scence_param: {}", self.scence_param))?;
+
+        let raw_scence_hex_str = bytes_to_hex_string(&current_scence_bytes);
+        let matched_type_entry = model_params.type_entries.iter().find(|te| {
+            !te.hex_prefix_remove.is_empty() && raw_scence_hex_str.starts_with(&te.hex_prefix_remove)
+        }).cloned().unwrap_or_else(|| {
+            model_params.type_entries.iter().find(|te| te.hex_prefix_remove.is_empty())
                 .cloned()
-                .unwrap_or_default()
-        } else {
-            let current_scence_bytes_for_match = data_encoding::BASE64.decode(self.scence_param.as_bytes())
-                 .with_context(|| format!("Failed to decode base64 scence_param for type matching: {}", self.scence_param))?;
-            let raw_scence_hex_str = bytes_to_hex_string(&current_scence_bytes_for_match);
-            model_params.type_entries.iter().find(|te| {
-                !te.hex_prefix_remove.is_empty() && raw_scence_hex_str.starts_with(&te.hex_prefix_remove)
-            }).cloned().unwrap_or_else(|| {
-                model_params.type_entries.iter().find(|te| te.hex_prefix_remove.is_empty())
-                    .cloned()
-                    .unwrap_or_default() 
-            })
-        };
+                .unwrap_or_default() 
+        });
 
-        if self.scence_param.is_empty() {
-            // Only generate modeCmd if scence_param is empty
-            let mut mode_cmd_payload = vec![0x33, 0x05, 0x04];
-            mode_cmd_payload.extend_from_slice(&self.code.to_le_bytes());
-            if !matched_type_entry.normal_command_suffix.is_empty() {
-                mode_cmd_payload.extend(hex_string_to_bytes(&matched_type_entry.normal_command_suffix)?);
+        if !matched_type_entry.hex_prefix_remove.is_empty() {
+            let remove_bytes = hex_string_to_bytes(&matched_type_entry.hex_prefix_remove)?;
+            if current_scence_bytes.starts_with(&remove_bytes) {
+                current_scence_bytes = current_scence_bytes[remove_bytes.len()..].to_vec();
             }
-            all_command_lines_data.push(mode_cmd_payload);
-        } else {
-            // Logic for non-empty scence_param (multi-line commands + modeCmd)
-            let mut current_scence_bytes = data_encoding::BASE64.decode(self.scence_param.as_bytes())
-                .with_context(|| format!("Failed to decode base64 scence_param: {}", self.scence_param))?;
+        }
 
-            // Step 6: Remove hex_prefix_remove (matched_type_entry is already determined above)
-            if !matched_type_entry.hex_prefix_remove.is_empty() {
-                let remove_bytes = hex_string_to_bytes(&matched_type_entry.hex_prefix_remove)?;
-                if current_scence_bytes.starts_with(&remove_bytes) {
-                    current_scence_bytes = current_scence_bytes[remove_bytes.len()..].to_vec();
-                }
+        let hex_prefix_add_bytes = hex_string_to_bytes(&matched_type_entry.hex_prefix_add)?;
+        let mut data_for_segmentation_payload = hex_prefix_add_bytes;
+        data_for_segmentation_payload.extend_from_slice(&current_scence_bytes);
+        
+        // This is the actual data that needs to be broken into 17-byte payloads,
+        // prefixed by 0x01 and num_lines_byte for the first line.
+        let mut temp_payload_for_num_lines_calc = vec![0x01]; // Start with 0x01
+        // Placeholder for num_lines_byte itself (1 byte)
+        temp_payload_for_num_lines_calc.push(0x00); // Placeholder, will be replaced
+        temp_payload_for_num_lines_calc.extend(data_for_segmentation_payload.iter().cloned());
+
+        let num_lines_byte = 
+            if temp_payload_for_num_lines_calc.is_empty() { // Should not be empty due to 0x01,0x00
+                1 
+            } else {
+                ((temp_payload_for_num_lines_calc.len() + 16) / 17).max(1) as u8
+            };
+
+        // Prepare full_payload_for_segmentation with the correct num_lines_byte
+        let mut full_payload_for_segmentation = vec![0x01, num_lines_byte];
+        full_payload_for_segmentation.extend(data_for_segmentation_payload); // Already has hex_prefix_add
+
+        let mut all_command_lines_data: Vec<Vec<u8>> = Vec::new();
+        let hex_multi_prefix_byte = u8::from_str_radix(&model_params.hex_multi_prefix, 16)
+            .with_context(|| format!("Invalid hex_multi_prefix: {}", model_params.hex_multi_prefix))?;
+
+        let mut payload_cursor = 0;
+        for i in 0..num_lines_byte {
+            // Added check to ensure we don't create an empty line if all payload is consumed
+            if payload_cursor >= full_payload_for_segmentation.len() && num_lines_byte > 0 {
+                 // This case should ideally be avoided by correct num_lines_byte calculation.
+                 // If num_lines_byte forced a loop but there's no data for this iteration.
+                 if i > 0 { // Only break if it's not the very first (potentially only) line
+                    // This might happen if num_lines_byte is slightly off.
+                    // For now, let's log if this happens unexpectedly.
+                    log::warn!("Payload cursor at end but loop continues, i: {}, num_lines_byte: {}", i, num_lines_byte);
+                    break; 
+                 }
             }
 
-            // Step 7: Add hex_prefix_add
-            let hex_prefix_add_bytes = hex_string_to_bytes(&matched_type_entry.hex_prefix_add)?;
-            let mut data_for_segmentation_payload = hex_prefix_add_bytes;
-            data_for_segmentation_payload.extend_from_slice(&current_scence_bytes);
+            let line_index_byte = if num_lines_byte == 1 { 0xff } 
+                                  else if i == num_lines_byte - 1 { 0xff } 
+                                  else { i };
             
-            let mut temp_payload_for_num_lines_calc = vec![0x01]; 
-            temp_payload_for_num_lines_calc.push(0x00); 
-            temp_payload_for_num_lines_calc.extend(data_for_segmentation_payload.iter().cloned());
-
-            let num_lines_byte = 
-                if temp_payload_for_num_lines_calc.is_empty() { 
-                    1 
-                } else {
-                    ((temp_payload_for_num_lines_calc.len() + 16) / 17).max(1) as u8
-                };
-
-            let mut full_payload_for_segmentation = vec![0x01, num_lines_byte];
-            full_payload_for_segmentation.extend(data_for_segmentation_payload); 
-
-            let hex_multi_prefix_byte = u8::from_str_radix(&model_params.hex_multi_prefix, 16)
-                .with_context(|| format!("Invalid hex_multi_prefix: {}", model_params.hex_multi_prefix))?;
-
-            let mut payload_cursor = 0;
-            for i in 0..num_lines_byte {
-                if payload_cursor >= full_payload_for_segmentation.len() && i > 0 {
-                     // log::warn!("Payload cursor at end but loop continues, i: {}, num_lines_byte: {}", i, num_lines_byte);
-                     break; 
-                }
-
-                let line_index_byte = if num_lines_byte == 1 { 0xff } 
-                                      else if i == num_lines_byte - 1 { 0xff } 
-                                      else { i };
-                
-                let mut current_line_data = vec![hex_multi_prefix_byte, line_index_byte];
-                
-                let chunk_end = (payload_cursor + 17).min(full_payload_for_segmentation.len());
-                if payload_cursor < chunk_end { 
-                     current_line_data.extend_from_slice(&full_payload_for_segmentation[payload_cursor..chunk_end]);
-                }
-                payload_cursor = chunk_end;
-                all_command_lines_data.push(current_line_data);
+            let mut current_line_data = vec![hex_multi_prefix_byte, line_index_byte];
+            
+            let chunk_end = (payload_cursor + 17).min(full_payload_for_segmentation.len());
+            if payload_cursor < chunk_end { 
+                 current_line_data.extend_from_slice(&full_payload_for_segmentation[payload_cursor..chunk_end]);
             }
-
-            // Add modeCmd (Step 13)
-            let mut mode_cmd_payload = vec![0x33, 0x05, 0x04];
-            mode_cmd_payload.extend_from_slice(&self.code.to_le_bytes()); 
-            if !matched_type_entry.normal_command_suffix.is_empty() {
-                mode_cmd_payload.extend(hex_string_to_bytes(&matched_type_entry.normal_command_suffix)?);
-            }
-            all_command_lines_data.push(mode_cmd_payload);
+            payload_cursor = chunk_end;
+            all_command_lines_data.push(current_line_data);
         }
 
-        // Common finishing steps for all cases
+        let mut mode_cmd_payload = vec![0x33, 0x05, 0x04];
+        mode_cmd_payload.extend_from_slice(&self.code.to_le_bytes()); 
+        if !matched_type_entry.normal_command_suffix.is_empty() {
+            mode_cmd_payload.extend(hex_string_to_bytes(&matched_type_entry.normal_command_suffix)?);
+        }
+        all_command_lines_data.push(mode_cmd_payload);
+
         let mut final_byte_stream: Vec<u8> = Vec::new();
-        if all_command_lines_data.is_empty() {
-             // This should only happen if scence_param was empty AND mode_cmd somehow wasn't added (which it should be).
-             // Or if the input 'code' itself is meant to be ignored if scence_param is empty.
-             // For now, if all_command_lines_data is empty, it implies an issue or an intentionally empty command set.
-             // The current logic ensures mode_cmd is always added if scence_param is empty.
-             // If scence_param is not empty, multi-lines + mode_cmd are added.
-             // So, all_command_lines_data should not be empty here.
-        }
-
         for line_data in all_command_lines_data {
             final_byte_stream.extend(finish(line_data));
         }
@@ -434,14 +411,6 @@ impl SetSceneCode {
             let mut temp_stream = on_cmd_finished;
             temp_stream.extend(final_byte_stream);
             final_byte_stream = temp_stream;
-        }
-
-        // If final_byte_stream is empty here, it means no commands were generated at all.
-        // This could happen if on_command is false and scence_param was empty,
-        // and if the mode_cmd was also somehow skipped (though current logic adds it).
-        // Returning an error for an empty command might be more robust.
-        if final_byte_stream.is_empty() {
-            return Err(anyhow!("No command bytes generated for SKU: {}, Scene Code: {}. This might happen if scence_param is empty and on_command is false, and mode_cmd was unexpectedly not generated.", self.sku, self.code));
         }
 
         Ok(final_byte_stream)
@@ -637,56 +606,6 @@ a3 ff 01 ff 05 01 c8 14 14 02 ee 14 01 00 ff 00 00 00 00 92
 33 05 04 d4 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 e6
 "
         );
-    }
-
-    #[test]
-    fn scene_command_empty_scence_param() {
-        ensure_params_loaded();
-        let sku = "H6065"; // Using a known SKU
-        let scence_param_b64 = ""; // Empty scence_param
-        let scene_code = 123; // Arbitrary scene code
-
-        // For H6065, default TypeEntry will be used for normal_command_suffix if specific conditions aren't met.
-        // The default TypeEntry has an empty normal_command_suffix.
-        // H6065 has type_entries, one with empty hex_prefix_remove is:
-        // { "type_entry": 1, "hex_prefix_remove": "1200000000", "hex_prefix_add": "04", "normal_command_suffix": "0047" }
-        // The logic for empty scence_param now tries to find a TypeEntry with empty hex_prefix_remove.
-        // For H6065, there isn't one. So it will use TypeEntry::default().
-        // Default TypeEntry has normal_command_suffix: "".
-        // So, modeCmd should be 330504 + code_le_bytes + padding + checksum.
-        // code 123 (0x7b) -> 0x7b00 (le)
-        // Expected modeCmd: 3305047b000000000000000000000000000000 + checksum
-        // Checksum of 33^05^04^7b = 0x47
-        // Expected: 3305047b00000000000000000000000000000047
-
-        let command_obj = SetSceneCode::new(scene_code, scence_param_b64.to_string(), sku.to_string());
-        let result_bytes = command_obj.encode().unwrap();
-        
-        let expected_bytes_str = "3305047b00000000000000000000000000000047";
-        let expected_bytes = hex_string_to_bytes(expected_bytes_str).unwrap();
-        
-        println!("SKU: {}", sku);
-        println!("Scene Param (b64): '{}'", scence_param_b64);
-        println!("Scene Code: {}", scene_code);
-        println!("Encoded bytes (hex) for empty scene: {}", bytes_to_hex_string(&result_bytes));
-        println!("Expected bytes (hex) for empty scene: {}", bytes_to_hex_string(&expected_bytes));
-
-        assert_eq!(result_bytes, expected_bytes, "Encoded bytes do not match expected for empty scence_param");
-
-        // Test with on_command = true for a different SKU, e.g., H6079
-        let sku_on_cmd = "H6079";
-        // H6079 has on_command: true, type: [] -> will use default TypeEntry
-        let command_obj_on_cmd = SetSceneCode::new(scene_code, scence_param_b64.to_string(), sku_on_cmd.to_string());
-        let result_bytes_on_cmd = command_obj_on_cmd.encode().unwrap();
-
-        let on_command_prefix_str = "3301010000000000000000000000000000000033"; // 330101 + padding + checksum (33^01^01=33)
-        let expected_bytes_on_cmd_str = format!("{}{}", on_command_prefix_str, expected_bytes_str);
-        let expected_bytes_on_cmd = hex_string_to_bytes(&expected_bytes_on_cmd_str).unwrap();
-        
-        println!("Encoded bytes (hex) for empty scene with on_command: {}", bytes_to_hex_string(&result_bytes_on_cmd));
-        println!("Expected bytes (hex) for empty scene with on_command: {}", bytes_to_hex_string(&expected_bytes_on_cmd));
-        
-        assert_eq!(result_bytes_on_cmd, expected_bytes_on_cmd, "Encoded bytes do not match expected for empty scence_param with on_command=true");
     }
 }
 
