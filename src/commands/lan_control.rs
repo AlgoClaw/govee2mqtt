@@ -1,11 +1,12 @@
 use crate::ble::{Base64HexBytes, SetSceneCode};
-use crate::lan_api::{Client, DiscoOptions, LanDevice as ActualLanDevice}; // Renamed to avoid conflict
-use crate::undoc_api::GoveeUndocumentedApi;
+use crate::lan_api::{Client, DiscoOptions, LanDevice as ActualLanDevice};
+use crate::govee_scenes::get_parsed_scenes_for_sku; 
+// GoveeUndocumentedApi is no longer directly used here for scenes
+// use crate::undoc_api::GoveeUndocumentedApi; 
 use clap_num::maybe_hex;
-use std::collections::BTreeMap;
 use std::net::IpAddr;
-use uncased::Uncased;
-use anyhow::anyhow; // Added for anyhow::anyhow!
+// use uncased::Uncased; // Removed unused import
+use anyhow::anyhow;
 
 #[derive(clap::Parser, Debug)]
 pub struct LanControlCommand {
@@ -31,18 +32,18 @@ enum SubCommand {
 	},
 	Command {
 		#[arg(value_parser=maybe_hex::<u8>)]
-		data: Vec	<u8>,
+		data: Vec<u8>,
 	},
 	Scene {
 		#[arg(long)]
 		list: bool,
 		#[arg(required_unless_present = "list")]
-		scene: Option		<String>,
+		scene: Option<String>,
 	},
 }
 
 impl LanControlCommand {
-	pub async fn run(&self, _args: &crate::Args) -> anyhow::Result			<()>{
+	pub async fn run(&self, _args: &crate::Args) -> anyhow::Result<()> {
 		let (client, _scan) = Client::new(DiscoOptions::default()).await?;
 		let device: ActualLanDevice = client.scan_ip(self.ip).await?; 
 
@@ -66,91 +67,37 @@ impl LanControlCommand {
 					.await?;
 			}
 			SubCommand::Scene { list, scene } => { 
-				let mut scene_code_by_name = BTreeMap::new();
-
-				// Use the specific device's SKU
-				let device_sku = device.sku.clone();
-
-				let categories_from_api =
-					GoveeUndocumentedApi::get_scenes_for_device(&device_sku).await?;
-
-				for category_api_data in categories_from_api {
-					for scene_api_data in category_api_data.scenes {
-						let main_scene_name_str = &scene_api_data.scene_name;
-						let mut added_combined_name_for_this_main_scene = false;
-
-						let eligible_effects: Vec				<_>= scene_api_data
-							.light_effects
-							.iter()
-							.filter(|effect_entry| !effect_entry.scence_name.is_empty())
-							.collect();
-
-						if eligible_effects.len() >= 2 {
-							for effect_entry in eligible_effects {
-								let combined_name_str = format!("{}-{}", main_scene_name_str, effect_entry.scence_name);
-								
-								let param_string = effect_entry.scence_param.clone(); 
-
-								scene_code_by_name.insert(
-									Uncased::new(combined_name_str),
-									SetSceneCode::new(effect_entry.scene_code, param_string, device_sku.clone()), // Added device_sku
-								);
-							}
-							added_combined_name_for_this_main_scene = true;
-						}
-
-						if !added_combined_name_for_this_main_scene {
-							let mut main_scene_added = false;
-							if !scene_api_data.light_effects.is_empty() {
-								for effect_entry in &scene_api_data.light_effects {
-										let param_string = effect_entry.scence_param.clone();
-										scene_code_by_name.insert(
-											Uncased::new(main_scene_name_str.clone()),
-											SetSceneCode::new(effect_entry.scene_code, param_string, device_sku.clone()), // Added device_sku
-										);
-										main_scene_added = true;
-										break; 
-								}
-							}
-							
-							if !main_scene_added {
-								 let code_u16 = match scene_api_data.scene_code.try_into() {
-									 Ok(c) => c,
-									 Err(_) => {
-										 log::warn!("Scene code {} for '{}' out of u16 range, using 0", scene_api_data.scene_code, main_scene_name_str);
-										 0 
-									 }
-								 };
-								 if code_u16 != 0 { 
-									 scene_code_by_name.insert(
-										Uncased::new(main_scene_name_str.clone()),
-										SetSceneCode::new(code_u16, String::new(), device_sku.clone()), // Added device_sku
-									);
-								 }
-							}
-						}
-					}
-				}
+				let parsed_scenes = get_parsed_scenes_for_sku(&device.sku).await?;
 
 				if *list {
-					for name_uncased in scene_code_by_name.keys() {
-						println!("{}", name_uncased.as_str());
+					if parsed_scenes.is_empty() {
+						println!("No scenes found for device SKU: {}", device.sku);
+					} else {
+						println!("Available scenes for {}:", device.sku);
+						for scene_info in parsed_scenes {
+							println!("- {}", scene_info.display_name);
+						}
 					}
 				} else {
-					let desired_scene_str = scene.clone().ok_or_else(|| anyhow!("Scene name must be provided if not listing"))?;
-					let scene_key = Uncased::new(desired_scene_str); 
-
-					if let Some(code_to_set) = scene_code_by_name.get(&scene_key) {
-						// The SKU passed to encode_for_sku is for the PacketManager to find the correct codec.
-						// SetSceneCode itself now holds its specific SKU internally for its encode method.
-						let encoded =
-							Base64HexBytes::encode_for_sku(&device_sku, code_to_set)?.base64();
-						println!("Setting scene '{}'. Computed payload: {:?}", scene_key.as_str(), encoded);
-						device.send_real(encoded).await?; 
+					let desired_scene_name_str = scene.as_ref().ok_or_else(|| anyhow!("Scene name must be provided if not listing"))?;
+					
+					if let Some(target_scene) = parsed_scenes.iter().find(|s| s.display_name == *desired_scene_name_str) {
+						let scene_to_set = SetSceneCode::new(
+							target_scene.scene_code,
+							target_scene.scence_param.clone(),
+							target_scene.sku.clone(), // This is device.sku
+						);
+						
+						let encoded_payload = Base64HexBytes::encode_for_sku(&device.sku, &scene_to_set)?.base64();
+						println!("Setting scene '{}' for device {}. Computed payload: {:?}", target_scene.display_name, device.sku, encoded_payload);
+						device.send_real(encoded_payload).await?;
 					} else {
-						anyhow::bail!("Scene '{}' not found. Available scenes: {:?}", 
-							scene_key.as_str(), 
-							scene_code_by_name.keys().map(|k| k.as_str()).collect::					<Vec<&str>>()
+						let available_scene_names: Vec<&str> = parsed_scenes.iter().map(|s| s.display_name.as_str()).collect();
+						anyhow::bail!(
+							"Scene '{}' not found for device SKU '{}'. Available scenes: {:?}", 
+							desired_scene_name_str, 
+							device.sku,
+							available_scene_names
 						);
 					}
 				}
@@ -161,7 +108,6 @@ impl LanControlCommand {
 				device.send_real(encoded).await?;
 			}
 		}
-
 		Ok(())
 	}
 }

@@ -6,7 +6,10 @@ use crate::service::device::Device;
 use crate::service::hass::{topic_safe_id, HassClient};
 use crate::service::iot::IotClient;
 use crate::temperature::{TemperatureScale, TemperatureValue};
-use crate::undoc_api::GoveeUndocumentedApi;
+// GoveeUndocumentedApi might still be used elsewhere, or by govee_scenes.rs itself.
+// If device_list_scenes was its only direct use here, it could be removed from this file's imports.
+use crate::undoc_api::GoveeUndocumentedApi; 
+use crate::govee_scenes::get_parsed_scenes_for_sku; // Import for centralized scene parsing
 use anyhow::Context;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -51,8 +54,6 @@ impl State {
         self.hass_discovery_prefix.lock().await.to_string()
     }
 
-    /// Returns a mutable version of the specified device, creating
-    /// an entry for it if necessary.
     pub async fn device_mut(&self, sku: &str, id: &str) -> MappedMutexGuard<Device> {
         let devices = self.devices_by_id.lock().await;
         MutexGuard::map(devices, |devices| {
@@ -66,7 +67,6 @@ impl State {
         self.devices_by_id.lock().await.values().cloned().collect()
     }
 
-    /// Returns an immutable copy of the specified Device
     pub async fn device_by_id(&self, id: &str) -> Option<Device> {
         let devices = self.devices_by_id.lock().await;
         devices.get(id).cloned()
@@ -87,12 +87,6 @@ impl State {
             .ok_or_else(|| anyhow::anyhow!("device '{label}' not found"))
     }
 
-    /// Resolve a device based on its label.
-    /// Assuming the device is found, returns a Coordinator, which is a
-    /// struct that ensures that only one task at a time can be processing
-    /// control requests for a device.
-    /// This method will not return until the calling task is permitted
-    /// to proceed with its control attempt.
     pub async fn resolve_device_for_control(
         self: &Arc<Self>,
         label: &str,
@@ -105,9 +99,6 @@ impl State {
         let permit = semaphore.acquire_owned().await?;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        // Schedule a task that will poll the device a short
-        // time after the Coordinator is dropped, to reconcile
-        // any changed state
         let state = self.clone();
         let device_id = device.id.to_string();
         tokio::spawn(async move {
@@ -118,12 +109,9 @@ impl State {
         Ok(Coordinator::new(device, permit, tx))
     }
 
-    /// Resolve a device using its name, computed name, id or label,
-    /// ignoring case.
     pub async fn resolve_device(&self, label: &str) -> Option<Device> {
         let devices = self.devices_by_id.lock().await;
 
-        // Try by id first
         if let Some(device) = devices.get(label) {
             return Some(device.clone());
         }
@@ -200,14 +188,9 @@ impl State {
                             log::error!("Failed: {err:#}");
                         }
                         Ok(()) => {
-                            // The response will come in async via the mqtt loop in iot.rs
-                            // However, if the device is offline, nothing will change our state.
-                            // Let's explicitly mark the device as having been polled so that
-                            // we don't keep sending a request every minute.
                             self.device_mut(&device.sku, &device.id)
                                 .await
                                 .set_last_polled();
-
                             return Ok(true);
                         }
                     }
@@ -229,9 +212,9 @@ impl State {
                 log::trace!("updated state for {device}");
 
                 {
-                    let mut device = self.device_mut(&device.sku, &device.id).await;
-                    device.set_http_device_state(http_state);
-                    device.set_last_polled();
+                    let mut device_mut = self.device_mut(&device.sku, &device.id).await;
+                    device_mut.set_http_device_state(http_state);
+                    device_mut.set_last_polled();
                 }
                 self.notify_of_state_change(&device.id)
                     .await
@@ -454,7 +437,6 @@ impl State {
         anyhow::bail!("Unable to control color temperature for {device}");
     }
 
-    // FIXME: this function probably shouldn't exist here
     async fn try_humidifier_set_nightlight<F: Fn(&mut SetHumidifierNightlightParams)>(
         self: &Arc<Self>,
         device: &Device,
@@ -575,10 +557,6 @@ impl State {
             return;
         }
 
-        // Add a slight delay, as the status returned
-        // by the platform API isn't guaranteed to be
-        // coherent with the command we just issued
-        // right away :-/
         sleep(Duration::from_secs(5)).await;
 
         log::info!("Polling {device} to get latest state after control");
@@ -588,60 +566,33 @@ impl State {
     }
 
     pub async fn device_list_scenes(&self, device: &Device) -> anyhow::Result<Vec<String>> {
-        // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
-                // If platform API is available and provides scenes, use that.
-                // This list might not have the combined "SceneName-EffectScenceName" format
-                // unless client.list_scene_names itself implements it.
-                return Ok(sort_and_dedup_scenes(client.list_scene_names(info).await?));
+                let platform_scenes = client.list_scene_names(info).await?;
+                if !platform_scenes.is_empty() {
+                    return Ok(sort_and_dedup_scenes(platform_scenes));
+                }
+                // If platform API returns empty, we might still want to try the undoc API.
             }
         }
 
-        // Fallback to Undocumented API for scene listing
-        // This part will now generate combined names.
-        match GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await {
-            Ok(categories) => { // categories is Vec<crate::undoc_api::LightEffectCategory>
-                let mut names = vec![];
-                for cat in categories { // cat is crate::undoc_api::LightEffectCategory
-                    for scene in cat.scenes { // scene is crate::undoc_api::LightEffectScene
-                        let main_api_scene_name = &scene.scene_name;
-                        let mut added_combined_name_for_this_main_scene = false;
-
-                        // scene.light_effects is Vec<crate::undoc_api::LightEffectEntry>
-                        let eligible_effects_for_combined_name: Vec<_> = scene
-                            .light_effects
-                            .iter()
-                            // effect is &crate::undoc_api::LightEffectEntry
-                            .filter(|effect| !effect.scence_name.is_empty())
-                            .collect();
-
-                        if eligible_effects_for_combined_name.len() >= 2 {
-                            for effect in eligible_effects_for_combined_name {
-                                names.push(format!(
-                                    "{}-{}",
-                                    main_api_scene_name, effect.scence_name
-                                ));
-                            }
-                            added_combined_name_for_this_main_scene = true;
-                        }
-
-                        // If no combined names were generated for this main scene,
-                        // add the main scene name itself.
-                        if !added_combined_name_for_this_main_scene {
-							names.push(main_api_scene_name.clone());
-                        }
-                    }
+        // Fallback to Undocumented API (via centralized govee_scenes parser)
+        match get_parsed_scenes_for_sku(&device.sku).await {
+            Ok(parsed_scenes) => { // parsed_scenes is Vec<crate::govee_scenes::ParsedScene>
+                let names: Vec<String> = parsed_scenes.into_iter().map(|s| s.display_name).collect();
+                if !names.is_empty() {
+                    return Ok(sort_and_dedup_scenes(names));
                 }
-                return Ok(sort_and_dedup_scenes(names));
             }
             Err(e) => {
-                log::warn!("Failed to get scenes via Undocumented API for {}: {}. Platform API was also unavailable or didn't provide scenes.", device, e);
+                log::warn!(
+                    "Failed to get scenes via centralized parser for {}: {}. Platform API was also unavailable or didn't provide scenes.",
+                    device, e
+                );
             }
         }
 
-        log::trace!("Platform and Undocumented API unavailable or returned no scenes: Don't know how to list scenes for {device}");
-
+        log::trace!("Platform API and centralized scene parser returned no scenes for {device}");
         Ok(vec![])
     }
 
@@ -670,7 +621,6 @@ impl State {
         device: &Device,
         scene: &str,
     ) -> anyhow::Result<()> {
-        // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
         let avoid_platform_api = device.avoid_platform_api();
 
         if !avoid_platform_api {
@@ -699,8 +649,6 @@ impl State {
         anyhow::bail!("Unable to set scene for {device}");
     }
 
-    // Take care not to call this while you hold a mutable device
-    // reference, as that will deadlock!
     pub async fn notify_of_state_change(self: &Arc<Self>, device_id: &str) -> anyhow::Result<()> {
         let Some(canonical_device) = self.device_by_id(&device_id).await else {
             anyhow::bail!("cannot find device {device_id}!?");

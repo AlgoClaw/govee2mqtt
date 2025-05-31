@@ -18,6 +18,8 @@ mod temperature;
 mod undoc_api;
 mod version_info;
 
+pub mod govee_scenes;
+
 #[derive(clap::Parser, Debug)]
 #[command(version = version_info::govee_version(),  propagate_version=true)]
 pub struct Args {

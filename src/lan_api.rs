@@ -1,7 +1,12 @@
 use crate::ble::{Base64HexBytes, SetSceneCode};
 use crate::opt_env_var;
 use crate::platform_api::from_json;
-use crate::undoc_api::GoveeUndocumentedApi;
+// Import for centralized scene parsing:
+// ParsedScene was removed as it was unused in this file.
+use crate::govee_scenes::{get_parsed_scenes_for_sku};
+// GoveeUndocumentedApi is no longer directly used in this file if set_scene_by_name was its only consumer.
+// However, govee_scenes.rs uses it, so the dependency remains in the project.
+// use crate::undoc_api::GoveeUndocumentedApi;
 use anyhow::Context;
 use if_addrs::IfAddr;
 use serde::{Deserialize, Serialize};
@@ -237,71 +242,43 @@ impl LanDevice {
 		.await
 	}
 
-	/// Sets a scene on the device by its name.
-	/// If a scene from the API has 2 or more light effects with non-empty "scenceName"
-	/// and a valid scene_code, this function will attempt to match `desired_scene_name_input`
-	/// against combined names like "MainSceneName-EffectScenceName".
-	/// Otherwise, it will try to match `desired_scene_name_input` against the main "sceneName"
-	/// from the API and use the first valid light effect's code.
+	/// Sets a scene on the device by its name using the centralized scene parsing logic.
 	pub async fn set_scene_by_name(
 		&self,
 		desired_scene_name_input: &str,
 	) -> anyhow::Result<()> {
-		let categories_from_api =
-			GoveeUndocumentedApi::get_scenes_for_device(&self.sku).await?;
+		// Use the centralized function to get parsed scenes
+		let parsed_scenes = get_parsed_scenes_for_sku(&self.sku).await?;
 
-		for category in categories_from_api {
-			for scene in &category.scenes {
-				let main_api_scene_name = &scene.scene_name; 
+		if let Some(target_scene) = parsed_scenes
+			.iter()
+			.find(|s| s.display_name == desired_scene_name_input)
+		{
+			// The SKU for SetSceneCode::new should be the one from the parsed scene,
+			// which is derived from self.sku when get_parsed_scenes_for_sku was called.
+			let scene_to_set = SetSceneCode::new(
+				target_scene.scene_code,
+				target_scene.scence_param.clone(),
+				target_scene.sku.clone(),
+			);
 
-				let eligible_effects_for_combined_name: Vec<_> = scene
-					.light_effects
-					.iter()
-					.filter(|eff| !eff.scence_name.is_empty())
-					.collect();
+			// The SKU for encode_for_sku is for the PacketManager to find the correct codec.
+			// This should be self.sku, as it's the actual device we're controlling.
+			let encoded_command = Base64HexBytes::encode_for_sku(
+				&self.sku,
+				&scene_to_set,
+			)?
+			.base64();
 
-				if eligible_effects_for_combined_name.len() >= 2 {
-					for effect in eligible_effects_for_combined_name {
-						let combined_name =
-							format!("{}-{}", main_api_scene_name, effect.scence_name);
-						if combined_name == desired_scene_name_input {
-							let encoded = Base64HexBytes::encode_for_sku(
-								&self.sku, // Use actual device SKU
-								&SetSceneCode::new(effect.scene_code, effect.scence_param.clone(), self.sku.clone()), 
-							)?
-							.base64();
-							log::info!(
-								"Sending scene packet for combined name '{}', using effect code {}. Encoded: {:?}",
-								combined_name,
-								effect.scene_code,
-								encoded
-							);
-							return self.send_real(encoded).await;
-						}
-					}
-				} else {
-					if main_api_scene_name == desired_scene_name_input {
-						for effect in &scene.light_effects {
-								let encoded = Base64HexBytes::encode_for_sku(
-									&self.sku, // Use actual device SKU
-									&SetSceneCode::new(
-										effect.scene_code,
-										effect.scence_param.clone(), 
-										self.sku.clone()
-									),
-								)?
-								.base64();
-								log::info!(
-									"Sending scene packet for main name '{}', using effect code {}. Encoded: {:?}",
-									main_api_scene_name,
-									effect.scene_code,
-									encoded
-								);
-								return self.send_real(encoded).await;
-						}
-					}
-				}
-			}
+			log::info!(
+				"Sending LAN scene packet for '{}' (Device SKU: {}). ParsedScene Code: {}, ParsedScene Param: '{}'. Encoded: {:?}",
+				target_scene.display_name,
+				self.sku,
+				target_scene.scene_code,
+				if target_scene.scence_param.len() > 20 { format!("{}...", &target_scene.scence_param[..20]) } else { target_scene.scence_param.clone() },
+				encoded_command
+			);
+			return self.send_real(encoded_command).await;
 		}
 
 		anyhow::bail!(
