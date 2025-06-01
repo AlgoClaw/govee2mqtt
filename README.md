@@ -22,3 +22,5 @@ This is a fork of [wez/govee2mqtt](https://github.com/wez/govee2mqtt) optimized 
 
 #### NOTES:
 - Nearly all modifications made in this fork were AI generated using Gemini 2.5 Pro (preview) with "Ultra" access.
+- Existing functionality for control via Govee API (with key) or AWS remain. However, I do not use these functions and modifications to the code may have broken these integrations. I have no interest in fixing these integartions if they break.
+- I am not competent in rust (although I am learning). If I cannot get Gemini to do the thing I want, I am likely not to proceed further.
