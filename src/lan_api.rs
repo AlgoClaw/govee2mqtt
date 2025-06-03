@@ -2,11 +2,7 @@ use crate::ble::{Base64HexBytes, SetSceneCode};
 use crate::opt_env_var;
 use crate::platform_api::from_json;
 // Import for centralized scene parsing:
-// ParsedScene was removed as it was unused in this file.
-use crate::govee_scenes::{get_parsed_scenes_for_sku};
-// GoveeUndocumentedApi is no longer directly used in this file if set_scene_by_name was its only consumer.
-// However, govee_scenes.rs uses it, so the dependency remains in the project.
-// use crate::undoc_api::GoveeUndocumentedApi;
+use crate::govee_scenes::get_parsed_scenes_for_sku;
 use anyhow::Context;
 use if_addrs::IfAddr;
 use serde::{Deserialize, Serialize};
@@ -33,575 +29,598 @@ const MULTICAST: IpAddr = IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250));
 
 #[derive(clap::Parser, Debug)]
 pub struct LanDiscoArguments {
-	/// Prevent the use of the default multicast broadcast address.
-	/// You may also set GOVEE_LAN_NO_MULTICAST=true via the environment.
-	#[arg(long, global = true)]
-	pub no_multicast: bool,
+    /// Prevent the use of the default multicast broadcast address.
+    /// You may also set GOVEE_LAN_NO_MULTICAST=true via the environment.
+    #[arg(long, global = true)]
+    pub no_multicast: bool,
 
-	/// Enumerate all interfaces, and for each one that has
-	/// a broadcast address, broadcast to it
-	/// You may also set GOVEE_LAN_BROADCAST_ALL=true via the environment.
-	#[arg(long, global = true)]
-	pub broadcast_all: bool,
+    /// Enumerate all interfaces, and for each one that has
+    /// a broadcast address, broadcast to it
+    /// You may also set GOVEE_LAN_BROADCAST_ALL=true via the environment.
+    #[arg(long, global = true)]
+    pub broadcast_all: bool,
 
-	/// Broadcast to the global broadcast address 255.255.255.255
-	/// You may also set GOVEE_LAN_BROADCAST_GLOBAL=true via the environment.
-	#[arg(long, global = true)]
-	pub global_broadcast: bool,
+    /// Broadcast to the global broadcast address 255.255.255.255
+    /// You may also set GOVEE_LAN_BROADCAST_GLOBAL=true via the environment.
+    #[arg(long, global = true)]
+    pub global_broadcast: bool,
 
-	/// Addresses to scan. May be broadcast addresses or individual
-	/// IP addresses. Can be specified multiple times.
-	/// You may also set GOVEE_LAN_SCAN=10.0.0.1,10.0.0.2 via the environment.
-	#[arg(long, global = true)]
-	pub scan: Vec<IpAddr>,
+    /// Addresses to scan. May be broadcast addresses or individual
+    /// IP addresses. Can be specified multiple times.
+    /// You may also set GOVEE_LAN_SCAN=10.0.0.1,10.0.0.2 via the environment.
+    #[arg(long, global = true)]
+    pub scan: Vec<IpAddr>,
 
-	/// How long to wait for discovery to complete, in seconds
-	/// You may also set GOVEE_LAN_DISCO_TIMEOUT via the environment.
-	#[arg(long, default_value_t = 3, global = true)]
-	disco_timeout: u64,
+    /// How long to wait for discovery to complete, in seconds
+    /// You may also set GOVEE_LAN_DISCO_TIMEOUT via the environment.
+    #[arg(long, default_value_t = 3, global = true)]
+    disco_timeout: u64,
 }
 
 pub fn truthy(s: &str) -> anyhow::Result<bool> {
-	if s.eq_ignore_ascii_case("true")
-		|| s.eq_ignore_ascii_case("yes")
-		|| s.eq_ignore_ascii_case("on")
-		|| s == "1"
-	{
-		Ok(true)
-	} else if s.eq_ignore_ascii_case("false")
-		|| s.eq_ignore_ascii_case("no")
-		|| s.eq_ignore_ascii_case("off")
-		|| s == "0"
-	{
-		Ok(false)
-	} else {
-		anyhow::bail!("invalid value '{s}', expected true/yes/on/1 or false/no/off/0");
-	}
+    if s.eq_ignore_ascii_case("true")
+        || s.eq_ignore_ascii_case("yes")
+        || s.eq_ignore_ascii_case("on")
+        || s == "1"
+    {
+        Ok(true)
+    } else if s.eq_ignore_ascii_case("false")
+        || s.eq_ignore_ascii_case("no")
+        || s.eq_ignore_ascii_case("off")
+        || s == "0"
+    {
+        Ok(false)
+    } else {
+        anyhow::bail!("invalid value '{s}', expected true/yes/on/1 or false/no/off/0");
+    }
 }
 
 impl LanDiscoArguments {
-	pub fn to_disco_options(&self) -> anyhow::Result<DiscoOptions> {
-		let mut options = DiscoOptions {
-			enable_multicast: !self.no_multicast,
-			additional_addresses: self.scan.clone(),
-			broadcast_all_interfaces: self.broadcast_all,
-			global_broadcast: self.global_broadcast,
-		};
+    pub fn to_disco_options(&self) -> anyhow::Result<DiscoOptions> {
+        let mut options = DiscoOptions {
+            enable_multicast: !self.no_multicast,
+            additional_addresses: self.scan.clone(),
+            broadcast_all_interfaces: self.broadcast_all,
+            global_broadcast: self.global_broadcast,
+        };
 
-		if let Some(v) = opt_env_var::<String>("GOVEE_LAN_NO_MULTICAST")? {
-			options.enable_multicast = !truthy(&v)?;
-		}
+        if let Some(v) = opt_env_var::<String>("GOVEE_LAN_NO_MULTICAST")? {
+            options.enable_multicast = !truthy(&v)?;
+        }
 
-		if let Some(v) = opt_env_var::<String>("GOVEE_LAN_BROADCAST_ALL")? {
-			options.broadcast_all_interfaces = truthy(&v)?;
-		}
+        if let Some(v) = opt_env_var::<String>("GOVEE_LAN_BROADCAST_ALL")? {
+            options.broadcast_all_interfaces = truthy(&v)?;
+        }
 
-		if let Some(v) = opt_env_var::<String>("GOVEE_LAN_BROADCAST_GLOBAL")? {
-			options.global_broadcast = truthy(&v)?;
-		}
+        if let Some(v) = opt_env_var::<String>("GOVEE_LAN_BROADCAST_GLOBAL")? {
+            options.global_broadcast = truthy(&v)?;
+        }
 
-		if let Some(v) = opt_env_var::<String>("GOVEE_LAN_SCAN")? {
-			for addr in v.split(',') {
-				let ip = addr
-					.trim()
-					.parse()
-					.with_context(|| format!("parsing {v} as IpAddr"))?;
-				options.additional_addresses.push(ip);
-			}
-		}
+        if let Some(v) = opt_env_var::<String>("GOVEE_LAN_SCAN")? {
+            for addr in v.split(',') {
+                let ip = addr
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("parsing {v} as IpAddr"))?;
+                options.additional_addresses.push(ip);
+            }
+        }
 
-		Ok(options)
-	}
+        Ok(options)
+    }
 
-	pub fn disco_timeout(&self) -> anyhow::Result<u64> {
-		if let Some(v) = opt_env_var("GOVEE_LAN_DISCO_TIMEOUT")? {
-			Ok(v)
-		} else {
-			Ok(self.disco_timeout)
-		}
-	}
+    pub fn disco_timeout(&self) -> anyhow::Result<u64> {
+        if let Some(v) = opt_env_var("GOVEE_LAN_DISCO_TIMEOUT")? {
+            Ok(v)
+        } else {
+            Ok(self.disco_timeout)
+        }
+    }
 }
 
 pub struct DiscoOptions {
-	/// Use the MULTICAST address defined in the LAN protocol
-	pub enable_multicast: bool,
-	/// Send to this list of additional addresses, which may
-	/// include multicast addresses
-	pub additional_addresses: Vec<IpAddr>,
-	/// Enumerate all interfaces, and for each one that has
-	/// a broadcast address, broadcast to it
-	pub broadcast_all_interfaces: bool,
-	/// Broadcast to the global broadcast address
-	pub global_broadcast: bool,
+    /// Use the MULTICAST address defined in the LAN protocol
+    pub enable_multicast: bool,
+    /// Send to this list of additional addresses, which may
+    /// include multicast addresses
+    pub additional_addresses: Vec<IpAddr>,
+    /// Enumerate all interfaces, and for each one that has
+    /// a broadcast address, broadcast to it
+    pub broadcast_all_interfaces: bool,
+    /// Broadcast to the global broadcast address
+    pub global_broadcast: bool,
 }
 
 impl DiscoOptions {
-	pub fn is_empty(&self) -> bool {
-		!self.enable_multicast
-			&& self.additional_addresses.is_empty()
-			&& !self.broadcast_all_interfaces
-			&& !self.global_broadcast
-	}
+    pub fn is_empty(&self) -> bool {
+        !self.enable_multicast
+            && self.additional_addresses.is_empty()
+            && !self.broadcast_all_interfaces
+            && !self.global_broadcast
+    }
 }
 
 impl Default for DiscoOptions {
-	fn default() -> Self {
-		Self {
-			enable_multicast: true,
-			additional_addresses: vec![],
-			broadcast_all_interfaces: false,
-			global_broadcast: false,
-		}
-	}
+    fn default() -> Self {
+        Self {
+            enable_multicast: true,
+            additional_addresses: vec![],
+            broadcast_all_interfaces: false,
+            global_broadcast: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "cmd", content = "data")]
 pub enum Request {
-	#[serde(rename = "scan")]
-	Scan { account_topic: AccountTopic },
-	#[serde(rename = "devStatus")]
-	DevStatus {},
-	#[serde(rename = "turn")]
-	Turn { value: u8 },
-	#[serde(rename = "brightness")]
-	Brightness { value: u8 },
-	#[serde(rename = "colorwc")]
-	Color {
-		color: DeviceColor,
-		#[serde(rename = "colorTemInKelvin")]
-		color_temperature_kelvin: u32,
-	},
-	#[serde(rename = "ptReal")]
-	PtReal { command: Vec<String> },
+    #[serde(rename = "scan")]
+    Scan { account_topic: AccountTopic },
+    #[serde(rename = "devStatus")]
+    DevStatus {},
+    #[serde(rename = "turn")]
+    Turn { value: u8 },
+    #[serde(rename = "brightness")]
+    Brightness { value: u8 },
+    #[serde(rename = "colorwc")]
+    Color {
+        color: DeviceColor,
+        #[serde(rename = "colorTemInKelvin")]
+        color_temperature_kelvin: u32,
+    },
+    #[serde(rename = "ptReal")]
+    PtReal { command: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct RequestMessage {
-	msg: Request,
+    msg: Request,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 pub struct LanDevice {
-	pub ip: IpAddr,
-	pub device: String,
-	pub sku: String,
-	#[serde(rename = "bleVersionHard")]
-	pub ble_version_hard: String,
-	#[serde(rename = "bleVersionSoft")]
-	pub ble_version_soft: String,
-	#[serde(rename = "wifiVersionHard")]
-	pub wifi_version_hard: String,
-	#[serde(rename = "wifiVersionSoft")]
-	pub wifi_version_soft: String,
+    pub ip: IpAddr,
+    pub device: String,
+    pub sku: String,
+    #[serde(rename = "bleVersionHard")]
+    pub ble_version_hard: String,
+    #[serde(rename = "bleVersionSoft")]
+    pub ble_version_soft: String,
+    #[serde(rename = "wifiVersionHard")]
+    pub wifi_version_hard: String,
+    #[serde(rename = "wifiVersionSoft")]
+    pub wifi_version_soft: String,
 }
 
 impl LanDevice {
-	pub async fn send_request(&self, msg: Request) -> anyhow::Result<()> {
-		log::trace!("LanDevice::send_request to {:?} {msg:?}", self.ip);
-		let client = udp_socket_for_target(self.ip).await?;
-		let data = serde_json::to_string(&RequestMessage { msg })?;
-		client.send_to(data.as_bytes(), (self.ip, CMD_PORT)).await?;
+    pub async fn send_request(&self, msg: Request) -> anyhow::Result<()> {
+        log::trace!("LanDevice::send_request to {:?} {msg:?}", self.ip);
+        let client = udp_socket_for_target(self.ip).await?;
+        let data = serde_json::to_string(&RequestMessage { msg })?;
+        client.send_to(data.as_bytes(), (self.ip, CMD_PORT)).await?;
 
-		Ok(())
-	}
+        Ok(())
+    }
 
-	pub async fn send_turn(&self, on: bool) -> anyhow::Result<()> {
-		self.send_request(Request::Turn {
-			value: if on { 1 } else { 0 },
-		})
-		.await
-	}
+    pub async fn send_turn(&self, on: bool) -> anyhow::Result<()> {
+        self.send_request(Request::Turn {
+            value: if on { 1 } else { 0 },
+        })
+        .await
+    }
 
-	pub async fn send_brightness(&self, percent: u8) -> anyhow::Result<()> {
-		self.send_request(Request::Brightness { value: percent })
-			.await
-	}
+    pub async fn send_brightness(&self, percent: u8) -> anyhow::Result<()> {
+        self.send_request(Request::Brightness { value: percent })
+            .await
+    }
 
-	pub async fn send_color_rgb(&self, color: DeviceColor) -> anyhow::Result<()> {
-		self.send_request(Request::Color {
-			color,
-			color_temperature_kelvin: 0,
-		})
-		.await
-	}
+    pub async fn send_color_rgb(&self, color: DeviceColor) -> anyhow::Result<()> {
+        self.send_request(Request::Color {
+            color,
+            color_temperature_kelvin: 0,
+        })
+        .await
+    }
 
-	pub async fn send_real(&self, commands: Vec<String>) -> anyhow::Result<()> {
-		self.send_request(Request::PtReal { command: commands })
-			.await
-	}
+    pub async fn send_real(&self, commands: Vec<String>) -> anyhow::Result<()> {
+        self.send_request(Request::PtReal { command: commands })
+            .await
+    }
 
-	pub async fn send_color_temperature_kelvin(
-		&self,
-		color_temperature_kelvin: u32,
-	) -> anyhow::Result<()> {
-		self.send_request(Request::Color {
-			color: DeviceColor { r: 0, g: 0, b: 0 },
-			color_temperature_kelvin,
-		})
-		.await
-	}
+    pub async fn send_color_temperature_kelvin(
+        &self,
+        color_temperature_kelvin: u32,
+    ) -> anyhow::Result<()> {
+        self.send_request(Request::Color {
+            color: DeviceColor { r: 0, g: 0, b: 0 },
+            color_temperature_kelvin,
+        })
+        .await
+    }
 
-	/// Sets a scene on the device by its name using the centralized scene parsing logic.
-	pub async fn set_scene_by_name(
-		&self,
-		desired_scene_name_input: &str,
-	) -> anyhow::Result<()> {
-		// Use the centralized function to get parsed scenes
-		let parsed_scenes = get_parsed_scenes_for_sku(&self.sku).await?;
+    /// Sets a scene on the device by its name using the centralized scene parsing logic.
+    pub async fn set_scene_by_name(
+        &self,
+        desired_scene_name_input: &str,
+    ) -> anyhow::Result<()> {
+        let parsed_scenes = get_parsed_scenes_for_sku(&self.sku).await?;
 
-		if let Some(target_scene) = parsed_scenes
-			.iter()
-			.find(|s| s.display_name == desired_scene_name_input)
-		{
-			// The SKU for SetSceneCode::new should be the one from the parsed scene,
-			// which is derived from self.sku when get_parsed_scenes_for_sku was called.
-			let scene_to_set = SetSceneCode::new(
-				target_scene.scene_code,
-				target_scene.scence_param.clone(),
-				target_scene.sku.clone(),
-			);
+        if let Some(target_scene) = parsed_scenes
+            .iter()
+            .find(|s| s.display_name == desired_scene_name_input)
+        {
+            // Handle override commands first
+            if let Some(ref override_commands) = target_scene.override_cmd_b64 {
+                log::info!(
+                    "Sending LAN scene packet for '{}' (Device SKU: {}) using override commands. Encoded: {:?}",
+                    target_scene.display_name,
+                    self.sku,
+                    override_commands
+                );
+                return self.send_real(override_commands.clone()).await;
+            }
 
-			// The SKU for encode_for_sku is for the PacketManager to find the correct codec.
-			// This should be self.sku, as it's the actual device we're controlling.
-			let encoded_command = Base64HexBytes::encode_for_sku(
-				&self.sku,
-				&scene_to_set,
-			)?
-			.base64();
+            // Fallback to encoding if no override and api_scence_param is available
+            if !target_scene.api_scence_param.is_empty() {
+                let scene_to_set = SetSceneCode::new(
+                    target_scene.scene_code,
+                    target_scene.api_scence_param.clone(), // Corrected
+                    target_scene.sku.clone(),
+                );
 
-			log::info!(
-				"Sending LAN scene packet for '{}' (Device SKU: {}). ParsedScene Code: {}, ParsedScene Param: '{}'. Encoded: {:?}",
-				target_scene.display_name,
-				self.sku,
-				target_scene.scene_code,
-				if target_scene.scence_param.len() > 20 { format!("{}...", &target_scene.scence_param[..20]) } else { target_scene.scence_param.clone() },
-				encoded_command
-			);
-			return self.send_real(encoded_command).await;
-		}
+                let encoded_command_container = Base64HexBytes::encode_for_sku(
+                    &self.sku,
+                    &scene_to_set,
+                )?;
+                let commands_b64 = encoded_command_container.base64();
 
-		anyhow::bail!(
-			"Unable to find and set scene matching '{}' for device SKU '{}', device ID '{}'",
-			desired_scene_name_input,
-			self.sku,
-			self.device
-		);
-	}
+                log::info!(
+                    "Sending LAN scene packet for '{}' (Device SKU: {}). ParsedScene Code: {}, ParsedScene Param: '{}'. Encoded: {:?}",
+                    target_scene.display_name,
+                    self.sku,
+                    target_scene.scene_code,
+                    if target_scene.api_scence_param.len() > 20 { // Corrected
+                        format!("{}...", &target_scene.api_scence_param[..20]) // Corrected
+                    } else {
+                        target_scene.api_scence_param.clone() // Corrected
+                    },
+                    commands_b64
+                );
+                if !commands_b64.is_empty() {
+                    return self.send_real(commands_b64).await;
+                } else {
+                    anyhow::bail!("SetSceneCode::encode produced an empty command set for scene '{}'", target_scene.display_name);
+                }
+            }
+            
+            anyhow::bail!(
+                "Scene '{}' found for device SKU '{}', but it has neither override commands nor API parameters for encoding.",
+                desired_scene_name_input,
+                self.sku
+            );
+        }
+
+        anyhow::bail!(
+            "Unable to find scene matching '{}' for device SKU '{}', device ID '{}'",
+            desired_scene_name_input,
+            self.sku,
+            self.device
+        );
+    }
 }
 
 pub fn boolean_int<'de, D: serde::de::Deserializer<'de>>(
-	deserializer: D,
+    deserializer: D,
 ) -> Result<bool, D::Error> {
-	Ok(match serde::de::Deserialize::deserialize(deserializer)? {
-		JsonValue::Bool(b) => b,
-		JsonValue::Number(num) => {
-			num.as_i64()
-				.ok_or(serde::de::Error::custom("Invalid number"))?
-				!= 0
-		}
-		JsonValue::Null => false,
-		_ => return Err(serde::de::Error::custom("Wrong type, expected boolean")),
-	})
+    Ok(match serde::de::Deserialize::deserialize(deserializer)? {
+        JsonValue::Bool(b) => b,
+        JsonValue::Number(num) => {
+            num.as_i64()
+                .ok_or(serde::de::Error::custom("Invalid number"))?
+                != 0
+        }
+        JsonValue::Null => false,
+        _ => return Err(serde::de::Error::custom("Wrong type, expected boolean")),
+    })
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceStatus {
-	#[serde(rename = "onOff", deserialize_with = "boolean_int")]
-	pub on: bool,
-	pub brightness: u8,
-	pub color: DeviceColor,
-	#[serde(rename = "colorTemInKelvin")]
-	pub color_temperature_kelvin: u32,
+    #[serde(rename = "onOff", deserialize_with = "boolean_int")]
+    pub on: bool,
+    pub brightness: u8,
+    pub color: DeviceColor,
+    #[serde(rename = "colorTemInKelvin")]
+    pub color_temperature_kelvin: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeviceColor {
-	pub r: u8,
-	pub g: u8,
-	pub b: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "cmd", content = "data")]
 pub enum Response {
-	#[serde(rename = "scan")]
-	Scan(LanDevice),
-	#[serde(rename = "devStatus")]
-	DevStatus(DeviceStatus),
+    #[serde(rename = "scan")]
+    Scan(LanDevice),
+    #[serde(rename = "devStatus")]
+    DevStatus(DeviceStatus),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ResponseWrapper {
-	msg: Response,
+    msg: Response,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum AccountTopic {
-	#[serde(rename = "reserve")]
-	Reserve,
+    #[serde(rename = "reserve")]
+    Reserve,
 }
 
 struct ClientListener {
-	addr: IpAddr,
-	tx: Sender<Response>,
+    addr: IpAddr,
+    tx: Sender<Response>,
 }
 
 #[derive(Default)]
 struct ClientInner {
-	mux: Mutex<Vec<ClientListener>>,
+    mux: Mutex<Vec<ClientListener>>,
 }
 
 #[derive(Clone)]
 pub struct Client {
-	inner: Arc<ClientInner>,
+    inner: Arc<ClientInner>,
 }
 
 #[derive(Debug)]
 struct Broadcaster {
-	addr: IpAddr,
-	socket: UdpSocket,
+    addr: IpAddr,
+    socket: UdpSocket,
 }
 
 async fn udp_socket_for_target(addr: IpAddr) -> std::io::Result<UdpSocket> {
-	match addr {
-		IpAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await,
-		IpAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await,
-	}
+    match addr {
+        IpAddr::V4(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await,
+        IpAddr::V6(_) => UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await,
+    }
 }
 
 impl Broadcaster {
-	pub async fn new(addr: IpAddr) -> std::io::Result<Self> {
-		let socket = udp_socket_for_target(addr).await?;
+    pub async fn new(addr: IpAddr) -> std::io::Result<Self> {
+        let socket = udp_socket_for_target(addr).await?;
 
-		if addr.is_multicast() {
-			match addr {
-				IpAddr::V4(v4) => {
-					socket.join_multicast_v4(v4, Ipv4Addr::UNSPECIFIED)?;
-					socket.set_multicast_loop_v4(false)?;
-				}
-				IpAddr::V6(v6) => {
-					socket.join_multicast_v6(&v6, 0)?;
-					socket.set_multicast_loop_v6(false)?;
-				}
-			}
-		} else {
-			socket.set_broadcast(true)?;
-		}
+        if addr.is_multicast() {
+            match addr {
+                IpAddr::V4(v4) => {
+                    socket.join_multicast_v4(v4, Ipv4Addr::UNSPECIFIED)?;
+                    socket.set_multicast_loop_v4(false)?;
+                }
+                IpAddr::V6(v6) => {
+                    socket.join_multicast_v6(&v6, 0)?;
+                    socket.set_multicast_loop_v6(false)?;
+                }
+            }
+        } else {
+            socket.set_broadcast(true)?;
+        }
 
-		Ok(Self { addr, socket })
-	}
+        Ok(Self { addr, socket })
+    }
 
-	pub async fn broadcast<B: AsRef<[u8]>>(&self, bytes: B) -> std::io::Result<()> {
-		self.socket
-			.send_to(bytes.as_ref(), (self.addr, SCAN_PORT))
-			.await?;
-		Ok(())
-	}
+    pub async fn broadcast<B: AsRef<[u8]>>(&self, bytes: B) -> std::io::Result<()> {
+        self.socket
+            .send_to(bytes.as_ref(), (self.addr, SCAN_PORT))
+            .await?;
+        Ok(())
+    }
 }
 
 async fn send_scan(options: &DiscoOptions) -> anyhow::Result<()> {
-	let mut addresses = options.additional_addresses.clone();
-	if options.enable_multicast {
-		addresses.push(MULTICAST);
-	}
-	if options.global_broadcast {
-		addresses.push(Ipv4Addr::BROADCAST.into());
-	}
-	if options.broadcast_all_interfaces {
-		match if_addrs::get_if_addrs() {
-			Ok(ifaces) => {
-				for iface in ifaces {
-					if iface.is_loopback() {
-						continue;
-					}
-					let bcast = match iface.addr {
-						IfAddr::V4(v4) => v4.broadcast.map(IpAddr::V4),
-						IfAddr::V6(v6) => v6.broadcast.map(IpAddr::V6),
-					};
-					if let Some(addr) = bcast {
-						log::debug!("Adding bcast {addr} from if {}", iface.name);
-						addresses.push(addr);
-					}
-				}
-			}
-			Err(err) => {
-				log::error!("get_if_addrs: {err:#}");
-			}
-		}
-	}
+    let mut addresses = options.additional_addresses.clone();
+    if options.enable_multicast {
+        addresses.push(MULTICAST);
+    }
+    if options.global_broadcast {
+        addresses.push(Ipv4Addr::BROADCAST.into());
+    }
+    if options.broadcast_all_interfaces {
+        match if_addrs::get_if_addrs() {
+            Ok(ifaces) => {
+                for iface in ifaces {
+                    if iface.is_loopback() {
+                        continue;
+                    }
+                    let bcast = match iface.addr {
+                        IfAddr::V4(v4) => v4.broadcast.map(IpAddr::V4),
+                        IfAddr::V6(v6) => v6.broadcast.map(IpAddr::V6),
+                    };
+                    if let Some(addr) = bcast {
+                        log::debug!("Adding bcast {addr} from if {}", iface.name);
+                        addresses.push(addr);
+                    }
+                }
+            }
+            Err(err) => {
+                log::error!("get_if_addrs: {err:#}");
+            }
+        }
+    }
 
-	let mut broadcasters = vec![];
-	for addr in addresses {
-		match Broadcaster::new(addr).await {
-			Ok(b) => broadcasters.push(b),
-			Err(err) => {
-				log::error!("{addr}: {err:#}");
-			}
-		}
-	}
+    let mut broadcasters = vec![];
+    for addr in addresses {
+        match Broadcaster::new(addr).await {
+            Ok(b) => broadcasters.push(b),
+            Err(err) => {
+                log::error!("{addr}: {err:#}");
+            }
+        }
+    }
 
-	let scan = serde_json::to_string(&RequestMessage {
-		msg: Request::Scan {
-			account_topic: AccountTopic::Reserve,
-		},
-	})
-	.expect("to serialize scan message");
-	for b in broadcasters {
-		log::trace!("Send disco packet to {:?}", b.addr);
-		if let Err(err) = b.broadcast(&scan).await {
-			log::error!("Error broadcasting to {b:?}: {err:#}");
-		}
-	}
-	Ok(())
+    let scan = serde_json::to_string(&RequestMessage {
+        msg: Request::Scan {
+            account_topic: AccountTopic::Reserve,
+        },
+    })
+    .expect("to serialize scan message");
+    for b in broadcasters {
+        log::trace!("Send disco packet to {:?}", b.addr);
+        if let Err(err) = b.broadcast(&scan).await {
+            log::error!("Error broadcasting to {b:?}: {err:#}");
+        }
+    }
+    Ok(())
 }
 
 async fn lan_disco(
-	options: DiscoOptions,
-	inner: Arc<ClientInner>,
+    options: DiscoOptions,
+    inner: Arc<ClientInner>,
 ) -> anyhow::Result<Receiver<LanDevice>> {
-	let listen = UdpSocket::bind(("0.0.0.0", LISTEN_PORT)).await.context(
-		"Cannot bind to UDP Port 4002, which is required \
-		for the Govee LAN API to function. Most likely cause is that you \
-		are running another integration (perhaps `Govee LAN Control`, or \
-		`homebridge-govee`) that is already bound to that port. \
-		Both cannot run on the same machine at the same time. \
-		Consider disabling `Govee LAN Control` or setting `lanDisable` in \
-		`homebridge-govee`.",
-	)?;
-	let (tx, rx) = channel(8);
+    let listen = UdpSocket::bind(("0.0.0.0", LISTEN_PORT)).await.context(
+        "Cannot bind to UDP Port 4002, which is required \
+        for the Govee LAN API to function. Most likely cause is that you \
+        are running another integration (perhaps `Govee LAN Control`, or \
+        `homebridge-govee`) that is already bound to that port. \
+        Both cannot run on the same machine at the same time. \
+        Consider disabling `Govee LAN Control` or setting `lanDisable` in \
+        `homebridge-govee`.",
+    )?;
+    let (tx, rx) = channel(8);
 
-	async fn process_packet(
-		addr: SocketAddr,
-		data: &[u8],
-		inner: &Arc<ClientInner>,
-		tx: &Sender<LanDevice>,
-	) -> anyhow::Result<()> {
-		log::trace!(
-			"process_packet: addr={addr:?} data={}",
-			String::from_utf8_lossy(data)
-		);
+    async fn process_packet(
+        addr: SocketAddr,
+        data: &[u8],
+        inner: &Arc<ClientInner>,
+        tx: &Sender<LanDevice>,
+    ) -> anyhow::Result<()> {
+        log::trace!(
+            "process_packet: addr={addr:?} data={}",
+            String::from_utf8_lossy(data)
+        );
 
-		let response: ResponseWrapper = from_json(data)
-			.with_context(|| format!("Parsing: {}", String::from_utf8_lossy(data)))?;
+        let response: ResponseWrapper = from_json(data)
+            .with_context(|| format!("Parsing: {}", String::from_utf8_lossy(data)))?;
 
-		let mut mux = inner.mux.lock().await;
-		mux.retain(|l| !l.tx.is_closed());
-		for l in mux.iter() {
-			if l.addr == addr.ip() {
-				l.tx.send(response.msg.clone()).await.ok();
-			}
-		}
+        let mut mux = inner.mux.lock().await;
+        mux.retain(|l| !l.tx.is_closed());
+        for l in mux.iter() {
+            if l.addr == addr.ip() {
+                l.tx.send(response.msg.clone()).await.ok();
+            }
+        }
 
-		if let Response::Scan(info) = response.msg {
-			tx.send(info).await?;
-		}
+        if let Response::Scan(info) = response.msg {
+            tx.send(info).await?;
+        }
 
-		Ok(())
-	}
+        Ok(())
+    }
 
-	async fn run_disco(
-		options: &DiscoOptions,
-		listen: UdpSocket,
-		tx: Sender<LanDevice>,
-		inner: Arc<ClientInner>,
-	) -> anyhow::Result<()> {
-		send_scan(options).await?;
+    async fn run_disco(
+        options: &DiscoOptions,
+        listen: UdpSocket,
+        tx: Sender<LanDevice>,
+        inner: Arc<ClientInner>,
+    ) -> anyhow::Result<()> {
+        send_scan(options).await?;
 
-		let mut retry_interval = Duration::from_secs(2);
-		let max_retry = Duration::from_secs(60);
-		let mut last_send = Instant::now();
-		loop {
-			let mut buf = [0u8; 4096];
+        let mut retry_interval = Duration::from_secs(2);
+        let max_retry = Duration::from_secs(60);
+        let mut last_send = Instant::now();
+        loop {
+            let mut buf = [0u8; 4096];
 
-			let deadline = last_send + retry_interval;
-			match tokio::time::timeout_at(deadline, listen.recv_from(&mut buf)).await {
-				Ok(Ok((len, addr))) => {
-					if let Err(err) = process_packet(addr, &buf[0..len], &inner, &tx).await {
-						log::error!("process_packet: {err:#}");
-					}
-				}
-				Ok(Err(err)) => {
-					log::error!("recv_from: {err:#}");
-				}
-				Err(_) => {
-					send_scan(options).await?;
-					last_send = Instant::now();
-					retry_interval = (retry_interval * 2).min(max_retry);
-				}
-			}
-		}
-	}
+            let deadline = last_send + retry_interval;
+            match tokio::time::timeout_at(deadline, listen.recv_from(&mut buf)).await {
+                Ok(Ok((len, addr))) => {
+                    if let Err(err) = process_packet(addr, &buf[0..len], &inner, &tx).await {
+                        log::error!("process_packet: {err:#}");
+                    }
+                }
+                Ok(Err(err)) => {
+                    log::error!("recv_from: {err:#}");
+                }
+                Err(_) => {
+                    send_scan(options).await?;
+                    last_send = Instant::now();
+                    retry_interval = (retry_interval * 2).min(max_retry);
+                }
+            }
+        }
+    }
 
-	tokio::spawn(async move {
-		if let Err(err) = run_disco(&options, listen, tx, inner).await {
-			log::error!("Error at the disco: {err:#}");
-		}
-	});
+    tokio::spawn(async move {
+        if let Err(err) = run_disco(&options, listen, tx, inner).await {
+            log::error!("Error at the disco: {err:#}");
+        }
+    });
 
-	Ok(rx)
+    Ok(rx)
 }
 
 impl Client {
-	pub async fn new(options: DiscoOptions) -> anyhow::Result<(Self, Receiver<LanDevice>)> {
-		let inner = Arc::new(ClientInner::default());
-		let rx = lan_disco(options, Arc::clone(&inner)).await?;
+    pub async fn new(options: DiscoOptions) -> anyhow::Result<(Self, Receiver<LanDevice>)> {
+        let inner = Arc::new(ClientInner::default());
+        let rx = lan_disco(options, Arc::clone(&inner)).await?;
 
-		Ok((Self { inner }, rx))
-	}
+        Ok((Self { inner }, rx))
+    }
 
-	async fn add_listener(&self, addr: IpAddr) -> anyhow::Result<Receiver<Response>> {
-		let (tx, rx) = channel(1);
-		let mut mux = self.inner.mux.lock().await;
-		mux.push(ClientListener { addr, tx });
-		Ok(rx)
-	}
+    async fn add_listener(&self, addr: IpAddr) -> anyhow::Result<Receiver<Response>> {
+        let (tx, rx) = channel(1);
+        let mut mux = self.inner.mux.lock().await;
+        mux.push(ClientListener { addr, tx });
+        Ok(rx)
+    }
 
-	/// Interrogate `addr` by sending a scan request to it.
-	/// If it is a Govee device that supports the lan protocol,
-	/// this method will yield a LanDevice representing it.
-	/// In addition, its details will be routed via the discovery
-	/// receiver.
-	pub async fn scan_ip(&self, addr: IpAddr) -> anyhow::Result<LanDevice> {
-		let mut rx = self.add_listener(addr).await?;
+    /// Interrogate `addr` by sending a scan request to it.
+    /// If it is a Govee device that supports the lan protocol,
+    /// this method will yield a LanDevice representing it.
+    /// In addition, its details will be routed via the discovery
+    /// receiver.
+    pub async fn scan_ip(&self, addr: IpAddr) -> anyhow::Result<LanDevice> {
+        let mut rx = self.add_listener(addr).await?;
 
-		let bcast = Broadcaster::new(addr).await?;
-		let scan = serde_json::to_string(&RequestMessage {
-			msg: Request::Scan {
-				account_topic: AccountTopic::Reserve,
-			},
-		})
-		.expect("to serialize scan message");
-		bcast.broadcast(scan).await?;
+        let bcast = Broadcaster::new(addr).await?;
+        let scan = serde_json::to_string(&RequestMessage {
+            msg: Request::Scan {
+                account_topic: AccountTopic::Reserve,
+            },
+        })
+        .expect("to serialize scan message");
+        bcast.broadcast(scan).await?;
 
-		loop {
-			match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
-				Ok(Some(Response::Scan(info))) => {
-					return Ok(info);
-				}
-				Ok(Some(_)) => {}
-				Ok(None) => anyhow::bail!("listener thread terminated"),
-				Err(_) => anyhow::bail!("timeout waiting for response"),
-			}
-		}
-	}
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(Response::Scan(info))) => {
+                    return Ok(info);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => anyhow::bail!("listener thread terminated"),
+                Err(_) => anyhow::bail!("timeout waiting for response"),
+            }
+        }
+    }
 
-	pub async fn query_status(&self, device: &LanDevice) -> anyhow::Result<DeviceStatus> {
-		let mut rx = self.add_listener(device.ip).await?;
-		let deadline = Instant::now() + Duration::from_secs(10);
-		while Instant::now() <= deadline {
-			log::trace!("query status of {}", device.ip);
-			device.send_request(Request::DevStatus {}).await?;
-			match tokio::time::timeout(Duration::from_millis(350), rx.recv()).await {
-				Ok(Some(Response::DevStatus(status))) => {
-					return Ok(status);
-				}
-				Ok(Some(_)) => {}
-				Ok(None) => anyhow::bail!("listener thread terminated"),
-				Err(_) => {}
-			}
-		}
+    pub async fn query_status(&self, device: &LanDevice) -> anyhow::Result<DeviceStatus> {
+        let mut rx = self.add_listener(device.ip).await?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() <= deadline {
+            log::trace!("query status of {}", device.ip);
+            device.send_request(Request::DevStatus {}).await?;
+            match tokio::time::timeout(Duration::from_millis(350), rx.recv()).await {
+                Ok(Some(Response::DevStatus(status))) => {
+                    return Ok(status);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => anyhow::bail!("listener thread terminated"),
+                Err(_) => {}
+            }
+        }
 
-		anyhow::bail!("timed out waiting for status");
-	}
+        anyhow::bail!("timed out waiting for status");
+    }
 }
