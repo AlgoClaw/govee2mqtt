@@ -44,6 +44,7 @@ ENV \
   XDG_CACHE_HOME=/data
 
 VOLUME /data
+VOLUME /JSONs
 
 CMD ["/app/govee", \
   "serve", \
